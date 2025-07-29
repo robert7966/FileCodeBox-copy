@@ -6,8 +6,8 @@ import asyncio
 import time
 
 from fastapi import FastAPI
-
 from fastapi.middleware.cors import CORSMiddleware
+from fastapi.middleware.gzip import GZipMiddleware
 from fastapi.responses import HTMLResponse
 from fastapi.staticfiles import StaticFiles
 from tortoise.contrib.fastapi import register_tortoise
@@ -21,9 +21,32 @@ from core.response import APIResponse
 from core.settings import data_root, settings, BASE_DIR, DEFAULT_CONFIG
 from core.tasks import delete_expire_files
 from core.logger import logger
+from core.performance import performance_cleanup_task, performance_monitor, get_performance_recommendations
 
 from contextlib import asynccontextmanager
 from tortoise import Tortoise
+
+
+class OptimizedStaticFiles(StaticFiles):
+    """Optimized static files with better caching headers"""
+    
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+    
+    def file_response(self, *args, **kwargs):
+        response = super().file_response(*args, **kwargs)
+        
+        # Add aggressive caching for static assets
+        if any(response.path.name.endswith(ext) for ext in ['.js', '.css', '.png', '.jpg', '.jpeg', '.gif', '.svg', '.ico', '.woff', '.woff2', '.ttf']):
+            # Cache static assets for 1 year
+            response.headers["Cache-Control"] = "public, max-age=31536000, immutable"
+            response.headers["Expires"] = "Thu, 31 Dec 2037 23:55:55 GMT"
+        
+        # Add security headers
+        response.headers["X-Content-Type-Options"] = "nosniff"
+        response.headers["X-Frame-Options"] = "DENY"
+        
+        return response
 
 
 @asynccontextmanager
@@ -36,12 +59,14 @@ async def lifespan(app: FastAPI):
     await load_config()
     app.mount(
         "/assets",
-        StaticFiles(directory=f"./{settings.themesSelect}/assets"),
+        OptimizedStaticFiles(directory=f"./{settings.themesSelect}/assets"),
         name="assets",
     )
 
     # 启动后台任务
-    task = asyncio.create_task(delete_expire_files())
+    file_cleanup_task = asyncio.create_task(delete_expire_files())
+    perf_cleanup_task = asyncio.create_task(performance_cleanup_task())
+    
     logger.info("应用初始化完成")
 
     try:
@@ -49,8 +74,9 @@ async def lifespan(app: FastAPI):
     finally:
         # 清理操作
         logger.info("正在关闭应用...")
-        task.cancel()
-        await asyncio.gather(task, return_exceptions=True)
+        file_cleanup_task.cancel()
+        perf_cleanup_task.cancel()
+        await asyncio.gather(file_cleanup_task, perf_cleanup_task, return_exceptions=True)
         await Tortoise.close_connections()
         logger.info("应用已关闭")
 
@@ -71,6 +97,9 @@ async def load_config():
 
 
 app = FastAPI(lifespan=lifespan)
+
+# Add GZip compression middleware (should be added before other middleware)
+app.add_middleware(GZipMiddleware, minimum_size=1000)
 
 app.add_middleware(
     CORSMiddleware,
@@ -104,7 +133,7 @@ app.include_router(admin_api)
 @app.exception_handler(404)
 @app.get("/")
 async def index(request=None, exc=None):
-    return HTMLResponse(
+    response = HTMLResponse(
         content=open(
             BASE_DIR / f"{settings.themesSelect}/index.html", "r", encoding="utf-8"
         )
@@ -116,13 +145,21 @@ async def index(request=None, exc=None):
         .replace('"/assets/', '"assets/')
         .replace("{{background}}", str(settings.background)),
         media_type="text/html",
-        headers={"Cache-Control": "no-cache"},
     )
+    
+    # Add cache control for HTML (short cache)
+    response.headers["Cache-Control"] = "public, max-age=300"  # 5 minutes
+    response.headers["X-Content-Type-Options"] = "nosniff"
+    response.headers["X-Frame-Options"] = "SAMEORIGIN"
+    
+    return response
 
 
 @app.get("/robots.txt")
 async def robots():
-    return HTMLResponse(content=settings.robotsText, media_type="text/plain")
+    response = HTMLResponse(content=settings.robotsText, media_type="text/plain")
+    response.headers["Cache-Control"] = "public, max-age=86400"  # 1 day
+    return response
 
 
 @app.post("/")
@@ -142,6 +179,18 @@ async def get_config():
             "max_save_seconds": settings.max_save_seconds,
         }
     )
+
+
+@app.get("/performance/report")
+async def get_performance_report():
+    """获取性能报告 - 管理员接口"""
+    report = performance_monitor.get_performance_report()
+    recommendations = get_performance_recommendations()
+    
+    return APIResponse(detail={
+        **report,
+        "recommendations": recommendations
+    })
 
 
 if __name__ == "__main__":

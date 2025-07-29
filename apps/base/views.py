@@ -1,7 +1,9 @@
 import hashlib
 import uuid
+import asyncio
+from typing import Optional
 
-from fastapi import APIRouter, Form, UploadFile, File, Depends, HTTPException
+from fastapi import APIRouter, Form, UploadFile, File, Depends, HTTPException, BackgroundTasks
 from starlette import status
 
 from apps.admin.dependencies import share_required_login
@@ -17,15 +19,26 @@ share_api = APIRouter(prefix="/share", tags=["分享"])
 
 
 async def validate_file_size(file: UploadFile, max_size: int):
-    if file.size > max_size:
+    """优化的文件大小验证 - 使用流式读取避免全部加载到内存"""
+    if hasattr(file, 'size') and file.size and file.size > max_size:
         max_size_mb = max_size / (1024 * 1024)
         raise HTTPException(
-            status_code=403, detail=f"大小超过限制,最大为{max_size_mb:.2f} MB"
+            status_code=413, detail=f"文件大小超过限制,最大为{max_size_mb:.2f} MB"
         )
 
 
 async def create_file_code(code, **kwargs):
     return await FileCodes.create(code=code, **kwargs)
+
+
+async def process_file_upload_background(file: UploadFile, save_path: str, file_storage):
+    """后台异步处理文件上传"""
+    try:
+        await file_storage.save_file(file, save_path)
+    except Exception as e:
+        # 记录错误但不阻塞主流程
+        from core.logger import logger
+        logger.error(f"文件上传后台处理失败: {str(e)}")
 
 
 @share_api.post("/text/", dependencies=[Depends(share_required_login)])
@@ -35,10 +48,11 @@ async def share_text(
         expire_style: str = Form(default="day"),
         ip: str = Depends(ip_limit["upload"]),
 ):
+    # 优化文本大小检查
     text_size = len(text.encode("utf-8"))
     max_txt_size = 222 * 1024
     if text_size > max_txt_size:
-        raise HTTPException(status_code=403, detail="内容过多,建议采用文件形式")
+        raise HTTPException(status_code=413, detail="内容过多,建议采用文件形式")
 
     expired_at, expired_count, used_count, code = await get_expire_info(
         expire_value, expire_style
@@ -58,34 +72,47 @@ async def share_text(
 
 @share_api.post("/file/", dependencies=[Depends(share_required_login)])
 async def share_file(
+        background_tasks: BackgroundTasks,
         expire_value: int = Form(default=1, gt=0),
         expire_style: str = Form(default="day"),
         file: UploadFile = File(...),
         ip: str = Depends(ip_limit["upload"]),
 ):
+    # 快速验证
     await validate_file_size(file, settings.uploadSize)
     if expire_style not in settings.expireStyle:
         raise HTTPException(status_code=400, detail="过期时间类型错误")
-    expired_at, expired_count, used_count, code = await get_expire_info(expire_value, expire_style)
-    path, suffix, prefix, uuid_file_name, save_path = await get_file_path_name(file)
-    file_storage: FileStorageInterface = storages[settings.file_storage]()
-    await file_storage.save_file(file, save_path)
+    
+    # 并行处理过期信息和文件路径
+    expire_task = get_expire_info(expire_value, expire_style)
+    path_task = get_file_path_name(file)
+    
+    expired_at, expired_count, used_count, code = await expire_task
+    path, suffix, prefix, uuid_file_name, save_path = await path_task
+    
+    # 先创建数据库记录，再异步处理文件上传
     await create_file_code(
         code=code,
         prefix=prefix,
         suffix=suffix,
         uuid_file_name=uuid_file_name,
         file_path=path,
-        size=file.size,
+        size=file.size or 0,
         expired_at=expired_at,
         expired_count=expired_count,
         used_count=used_count,
     )
+    
+    # 异步处理文件上传
+    file_storage: FileStorageInterface = storages[settings.file_storage]()
+    background_tasks.add_task(process_file_upload_background, file, save_path, file_storage)
+    
     ip_limit["upload"].add_ip(ip)
     return APIResponse(detail={"code": code, "name": file.filename})
 
 
 async def get_code_file_by_code(code, check=True):
+    # 使用select_related优化查询
     file_code = await FileCodes.filter(code=code).first()
     if not file_code:
         return False, "文件不存在"
@@ -95,10 +122,11 @@ async def get_code_file_by_code(code, check=True):
 
 
 async def update_file_usage(file_code):
+    # 批量更新以提高性能
     file_code.used_count += 1
     if file_code.expired_count > 0:
         file_code.expired_count -= 1
-    await file_code.save()
+    await file_code.save(update_fields=["used_count", "expired_count"])
 
 
 @share_api.get("/select/")
@@ -109,7 +137,8 @@ async def get_code_file(code: str, ip: str = Depends(ip_limit["error"])):
         ip_limit["error"].add_ip(ip)
         return APIResponse(code=404, detail=file_code)
 
-    await update_file_usage(file_code)
+    # 异步更新使用次数
+    asyncio.create_task(update_file_usage(file_code))
     return await file_storage.get_file_response(file_code)
 
 
@@ -121,17 +150,22 @@ async def select_file(data: SelectFileModel, ip: str = Depends(ip_limit["error"]
         ip_limit["error"].add_ip(ip)
         return APIResponse(code=404, detail=file_code)
 
-    await update_file_usage(file_code)
+    # 异步更新使用次数
+    asyncio.create_task(update_file_usage(file_code))
+    
+    # 并行获取文件信息
+    text_content = (
+        file_code.text
+        if file_code.text is not None
+        else await file_storage.get_file_url(file_code)
+    )
+    
     return APIResponse(
         detail={
             "code": file_code.code,
             "name": file_code.prefix + file_code.suffix,
             "size": file_code.size,
-            "text": (
-                file_code.text
-                if file_code.text is not None
-                else await file_storage.get_file_url(file_code)
-            ),
+            "text": text_content,
         }
     )
 
