@@ -10,12 +10,35 @@ from core.settings import data_root
 
 async def init_db():
     try:
-        # 使用正确的Tortoise初始化配置格式
+        # 优化的SQLite配置
+        db_url = f"sqlite://{data_root}/filecodebox.db"
+        
+        # SQLite性能优化配置
         db_config = {
-            "db_url": f"sqlite://{data_root}/filecodebox.db",
+            "db_url": db_url,
             "modules": {"models": ["apps.base.models"]},
             "use_tz": False,
-            "timezone": "Asia/Shanghai"
+            "timezone": "Asia/Shanghai",
+            # 连接池配置
+            "connections": {
+                "default": {
+                    "engine": "tortoise.backends.sqlite",
+                    "credentials": {
+                        "file_path": f"{data_root}/filecodebox.db",
+                        # SQLite性能优化设置
+                        "options": {
+                            "init_command": [
+                                "PRAGMA journal_mode=WAL;",           # WAL模式提高并发性能
+                                "PRAGMA synchronous=NORMAL;",         # 平衡性能和安全性
+                                "PRAGMA cache_size=10000;",           # 增加缓存大小(约40MB)
+                                "PRAGMA temp_store=MEMORY;",          # 临时表存储在内存中
+                                "PRAGMA mmap_size=268435456;",        # 启用内存映射(256MB)
+                                "PRAGMA optimize;",                   # 自动优化
+                            ]
+                        }
+                    }
+                }
+            }
         }
 
         await Tortoise.init(**db_config)
@@ -31,10 +54,41 @@ async def init_db():
 
         # 执行迁移
         await execute_migrations()
+        
+        # 应用性能优化设置
+        await optimize_database()
 
     except Exception as e:
         logger.error(f"数据库初始化失败: {str(e)}")
         raise
+
+
+async def optimize_database():
+    """应用数据库性能优化设置"""
+    try:
+        conn = Tortoise.get_connection("default")
+        
+        # 应用SQLite性能优化
+        optimization_queries = [
+            "PRAGMA journal_mode=WAL;",
+            "PRAGMA synchronous=NORMAL;", 
+            "PRAGMA cache_size=10000;",
+            "PRAGMA temp_store=MEMORY;",
+            "PRAGMA mmap_size=268435456;",
+            "PRAGMA optimize;",
+            # 启用查询规划器优化
+            "PRAGMA query_only=0;",
+            # 设置超时时间
+            "PRAGMA busy_timeout=30000;",
+        ]
+        
+        for query in optimization_queries:
+            await conn.execute_query(query)
+            
+        logger.info("数据库性能优化设置已应用")
+        
+    except Exception as e:
+        logger.warning(f"数据库优化设置失败: {str(e)}")
 
 
 async def execute_migrations():
